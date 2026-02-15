@@ -1,4 +1,6 @@
 import os
+import requests
+from bs4 import BeautifulSoup
 
 from langchain_gigachat import GigaChat
 from langchain_core.tools import tool
@@ -38,6 +40,10 @@ class SimpleMemory:
 def check_asv(bank_name: str = None, amount: int = None, currency: str = 'RUB') -> str:
     """
     ПРОВЕРКА ЛИМИТА АСВ. Требует банк и сумму!
+    Если пользователь не указал валюту - по умолчанию используются рубли.
+    Если пользователь указал доллары - currency = "USD",
+    если евро - currency = "EUR",
+    юани - currency = "CNY"
 
     Args:
         bank_name: название банка (Сбер, Тинькофф, ВТБ и т.д.)
@@ -59,6 +65,75 @@ def check_asv(bank_name: str = None, amount: int = None, currency: str = 'RUB') 
                 f"превышение: {delta} рублей.")
     return "Все хорошо, лимит не превышен."
 
+
+@tool
+def calculate_real_yield(bank_name: str = None, amount: int = None, rate: float = None, currency: str = 'RUB') -> str:
+    """
+    РАССЧЕТ РЕАЛЬНОЙ ДОХОДНОСТИ ВКЛАДА. Требует банк, процентную ставку вклада и сумму!
+    Если пользователь не указал валюту - по умолчанию используются рубли.
+    Если пользователь указал доллары - currency = "USD",
+    если евро - currency = "EUR",
+    юани - currency = "CNY"
+
+    Args:
+        bank_name: название банка (Сбер, Тинькофф, ВТБ и т.д.)
+        amount: сумма в цифрах
+        currency: валюта (RUB, USD, EUR)
+        rate: процентная ставка по вкладу (например 10.0)
+    Returns:
+        Ответ в виде строки, содержащий:
+        - Информацию о реальной доходности вклада
+        - Предупреждение, что вклад валютный (если валюта вклада не рубли)
+        ЕСЛИ НЕ ПОЛУЧАЕТСЯ РАССЧИТАТЬ РЕАЛЬНУЮ ДОХОДНОСТЬ - СКАЖИ ОБ ЭТОМ ПОЛЬЗОВАТЕЛЮ!!!
+    """
+    if currency != "RUB":
+        return "Не могу рассчитать реальную доходность по валютному вкладу!"
+    inflation_rate = get_inflation_rate()
+    if inflation_rate is None:
+        return "Не удалось получить информацию об инфляции. Не получится рассчитать реальную доходность.ы"
+    real_rate = float(rate / 100.0)- inflation_rate
+    if real_rate < 0:
+        return (f"Доходность вклада в банке {bank_name} не покрывает инфляцию! "
+                f"Текущая инфляция: {inflation_rate} %, Ваша ставка по депозиту: {rate} %")
+    elif real_rate == 0:
+        return (f"Доходность вклада в банке {bank_name} равна инфляции."
+                f"Текущая инфляция: {inflation_rate} %, Ваша ставка по депозиту: {rate} %")
+    else:
+        return (f"Доходность вклада в банке {bank_name} больше инфляции - вы зарабатываете с помощью вклада!"
+                f"Текущая инфляция: {inflation_rate} %, Ваша ставка по депозиту: {rate} %, "
+                f"примерная годовая доходность: {real_rate * amount} рублей")
+
+
+def get_inflation_rate() -> float | None:
+    """
+    Парсинг сайта ЦБ РФ для получения текущего значения инфляции
+    """
+    url = "https://cbr.ru/hd_base/infl/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            return None
+        else:
+            soup = BeautifulSoup(response.content, "html.parser")
+            table = soup.find('table')
+            if not table:
+                return None
+            rows = table.find_all('tr')
+            if len(rows) < 2:
+                return None
+            second_row = rows[1]
+            cells = second_row.find_all('td')
+            if len(cells) < 3:
+                return None
+            third_cell = cells[2]
+            value_text = third_cell.get_text(strip=True).replace(',', '.')
+
+            return float(value_text) / 100.0
+    except Exception as e:
+        return None
 
 root = os.path.dirname(__file__)
 print(root)
