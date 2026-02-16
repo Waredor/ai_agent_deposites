@@ -1,148 +1,129 @@
 import os
 import requests
-from bs4 import BeautifulSoup
 
-from langchain_gigachat import GigaChat
+#from bs4 import BeautifulSoup
+from typing import TypedDict, Literal, Annotated
 from langchain_core.tools import tool
-from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_gigachat import GigaChat
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 
 
-class SimpleMemory:
-    """
-    Класс памяти для ИИ-агента
-    """
-
-    def __init__(self):
-        self.history = []
-
-    def load_memory_variables(self):
-        """Возвращает историю для промпта"""
-        history_text = ""
-        for msg in self.history:
-            history_text += f"{msg}\n"
-
-        return {"chat_history": history_text}
-
-    def save_context(self, role: str, message: str):
-        """Сохраняет сообщение в историю"""
-        if role == "user":
-            self.history.append({"role": "user", "content": message})
-
-        else:
-            self.history.append({"role": "assistant", "content": message})
-
-    def clear(self):
-        """Очищает историю"""
-        self.history = []
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
 
 
 @tool
-def check_asv(bank_name: str = None, amount: int = None, currency: str = 'RUB') -> str:
+def check_asv(bank_name: str, amount: int, currency: str = 'RUB') -> str:
     """
-    ПРОВЕРКА ЛИМИТА АСВ. Требует банк и сумму!
-    Если пользователь не указал валюту - по умолчанию используются рубли.
-    Если пользователь указал доллары - currency = "USD",
-    если евро - currency = "EUR",
-    юани - currency = "CNY"
+    ПРОВЕРКА ЛИМИТА АСВ.
+
+    ВНИМАНИЕ! Это ЕДИНСТВЕННЫЙ инструмент для проверки вкладов.
+    ТРЕБУЕТСЯ ОБЯЗАТЕЛЬНО передать ВСЕ ТРИ параметра:
 
     Args:
-        bank_name: название банка (Сбер, Тинькофф, ВТБ и т.д.)
-        amount: сумма в цифрах
-        currency: валюта (RUB, USD, EUR)
-    Returns:
-        Ответ в виде строки, содержащий:
-        - Информацию по превышению лимита АСВ
-        - Предупреждение, что вклад валютный (если валюта вклада не рубли)
+        bank_name: СТРОКА - название банка (Сбер, Тинькофф, ВТБ, Райффайзен и т.д.)
+        amount: ЧИСЛО - сумма вклада (например, 5000, 2500000, 500000)
+        currency: СТРОКА - валюта: RUB, USD, EUR (по умолчанию RUB)
+
+    ВОЗВРАЩАЕТ:
+        Строку с результатом проверки.
+
+    ПРИМЕРЫ ПРАВИЛЬНОГО ВЫЗОВА:
+        check_asv(bank_name="Сбер", amount=2500000, currency="RUB")
+        check_asv(bank_name="Райффайзенбанк", amount=5000, currency="USD")
+        check_asv(bank_name="Тинькофф", amount=800000, currency="RUB")
+
+    НЕПРАВИЛЬНЫЙ ВЫЗОВ (ТАК ДЕЛАТЬ НЕЛЬЗЯ):
+        check_asv(bank_name="Сбер")  # ОШИБКА! Нет amount
+        check_asv(amount=5000)  # ОШИБКА! Нет bank_name
     """
-    if not bank_name or not amount:
-        return "Не хватает данных: укажите банк и сумму"
+    if not bank_name or not isinstance(bank_name, str):
+        return "ОШИБКА: Не указано название банка. Пожалуйста, укажите банк."
+
+    if not amount or not isinstance(amount, (int, float)):
+        return "ОШИБКА: Не указана сумма вклада. Пожалуйста, укажите сумму."
+
+    if amount <= 0:
+        return "ОШИБКА: Сумма должна быть положительным числом."
+
     if currency != "RUB":
         return "АСВ не страхует валютные вклады!"
+
     if amount > 1400000:
         delta = amount - 1400000
         return (f"Превышен лимит АСВ! Лимит: 1400000 рублей, ваш вклад в банке {bank_name}:"
                 f" {amount} рублей,"
                 f"превышение: {delta} рублей.")
+
     return "Все хорошо, лимит не превышен."
 
 
-@tool
-def calculate_real_yield(bank_name: str = None, amount: int = None, rate: float = None, currency: str = 'RUB') -> str:
+def call_agent(state: AgentState):
     """
-    РАССЧЕТ РЕАЛЬНОЙ ДОХОДНОСТИ ВКЛАДА. Требует банк, процентную ставку вклада и сумму!
-    Если пользователь не указал валюту - по умолчанию используются рубли.
-    Если пользователь указал доллары - currency = "USD",
-    если евро - currency = "EUR",
-    юани - currency = "CNY"
+    Этот узел вызывает LLM.
+    Модель может:
+    1. Просто ответить пользователю
+    2. Решить, что нужно вызвать инструмент (тогда в ответе будет tool_calls)
+    """
+    print("\nУЗЕЛ: call_agent")
+    print(f"Сообщений в истории: {len(state['messages'])}")
 
-    Args:
-        bank_name: название банка (Сбер, Тинькофф, ВТБ и т.д.)
-        amount: сумма в цифрах
-        currency: валюта (RUB, USD, EUR)
-        rate: процентная ставка по вкладу (например 10.0)
-    Returns:
-        Ответ в виде строки, содержащий:
-        - Информацию о реальной доходности вклада
-        - Предупреждение, что вклад валютный (если валюта вклада не рубли)
-        ЕСЛИ НЕ ПОЛУЧАЕТСЯ РАССЧИТАТЬ РЕАЛЬНУЮ ДОХОДНОСТЬ - СКАЖИ ОБ ЭТОМ ПОЛЬЗОВАТЕЛЮ!!!
-    """
-    if currency != "RUB":
-        return "Не могу рассчитать реальную доходность по валютному вкладу!"
-    inflation_rate = get_inflation_rate()
-    if inflation_rate is None:
-        return "Не удалось получить информацию об инфляции. Не получится рассчитать реальную доходность.ы"
-    real_rate = float(rate / 100.0)- inflation_rate
-    if real_rate < 0:
-        return (f"Доходность вклада в банке {bank_name} не покрывает инфляцию! "
-                f"Текущая инфляция: {inflation_rate} %, Ваша ставка по депозиту: {rate} %")
-    elif real_rate == 0:
-        return (f"Доходность вклада в банке {bank_name} равна инфляции."
-                f"Текущая инфляция: {inflation_rate} %, Ваша ставка по депозиту: {rate} %")
+    # Создаем системное сообщение
+    system_message = SystemMessage(content=SYSTEM_PROMPT)
+    messages = state["messages"]
+
+    has_system = any(isinstance(msg, SystemMessage) for msg in messages)
+
+    if not has_system:
+        full_messages = [system_message] + messages
+        print("Добавлен системный промпт")
     else:
-        return (f"Доходность вклада в банке {bank_name} больше инфляции - вы зарабатываете с помощью вклада!"
-                f"Текущая инфляция: {inflation_rate} %, Ваша ставка по депозиту: {rate} %, "
-                f"примерная годовая доходность: {real_rate * amount} рублей")
+        full_messages = messages
+        print("Системный промпт уже есть в истории")
+
+    # Вызываем модель с полной историей
+    response = model_with_tools.invoke(full_messages)
+
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        print(f"Модель РЕШИЛА вызвать инструмент: {response.tool_calls[0]['name']}")
+        print(f"Параметры: {response.tool_calls[0]['args']}")
+    else:
+        print(f"Модель ОТВЕЧАЕТ: {response.content[:50]}...")
+
+    return {"messages": [response]}
 
 
-def get_inflation_rate() -> float | None:
+def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
     """
-    Парсинг сайта ЦБ РФ для получения текущего значения инфляции
+    Эта функция решает, что делать дальше:
+    - Если модель вызвала инструменты → идем в tools
+    - Если модель просто ответила → завершаем
     """
-    url = "https://cbr.ru/hd_base/infl/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code != 200:
-            return None
-        else:
-            soup = BeautifulSoup(response.content, "html.parser")
-            table = soup.find('table')
-            if not table:
-                return None
-            rows = table.find_all('tr')
-            if len(rows) < 2:
-                return None
-            second_row = rows[1]
-            cells = second_row.find_all('td')
-            if len(cells) < 3:
-                return None
-            third_cell = cells[2]
-            value_text = third_cell.get_text(strip=True).replace(',', '.')
+    print("\nМАРШРУТИЗАТОР")
 
-            return float(value_text) / 100.0
-    except Exception as e:
-        return None
+    last_message = state["messages"][-1]
+
+    # Проверяем, есть ли вызовы инструментов
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        print("Решение: вызвать инструменты (идем в tools)")
+        return "tools"
+
+    print("Решение: ответ готов (завершаем)")
+    return "__end__"
 
 root = os.path.dirname(__file__)
 print(root)
 prompt_path = os.path.join(root, "prompts", "prompt_financial_agent.txt")
 
 with open(prompt_path, mode='r', encoding='utf-8') as f:
-    financial_agent_prompt = f.read()
+    SYSTEM_PROMPT = f.read()
 
-model = GigaChat(
+tools = [check_asv]
+
+llm = GigaChat(
     credentials="MDE5YTJiN2MtZjg4NC03MDJiLWE3NWMtNGRlZWE0NDU1ZDJlOmUxMWRkODZkLTI3NWYtNDVhMC1iMWQ0LTZmNzQ5OTYwMTAxYw==",
     model="Gigachat",
     scope="GIGACHAT_API_PERS",
@@ -150,13 +131,25 @@ model = GigaChat(
     temperature=0.3
 )
 
-agent = create_agent(
-    model=model,
-    tools=[check_asv],
-    system_prompt=financial_agent_prompt
+model_with_tools = llm.bind_tools(tools)
+tool_node = ToolNode(tools)
+
+workflow = StateGraph(AgentState)
+workflow.add_node("agent", call_agent)
+workflow.add_node("tools", tool_node)
+
+workflow.add_edge(START, "agent")
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {
+        "tools": "tools",
+        "__end__": END
+    }
 )
 
-memory = SimpleMemory()
+workflow.add_edge("tools", "agent")
+agent = workflow.compile()
 
 
 def main():
@@ -165,6 +158,10 @@ def main():
     print("Например: 'У меня в сбере 2.5 млн рублей'")
     print("Или: '5000 долларов в райффайзене'")
     print("Для выхода напишите 'пока'\n")
+
+    state = {
+        "messages": []
+    }
 
     while True:
         user_input = input("Вы: ").strip()
@@ -176,41 +173,17 @@ def main():
         if not user_input:
             continue
 
-        history_text = memory.load_memory_variables()["chat_history"]
-        print(f'history:\n{history_text}')
-        user_input_formated = f'Запрос: {user_input}, история: {history_text}'
-        memory.save_context(role="user", message=user_input)
-        #print(f"user_input:\n{user_input}")
-
+        state["messages"].append(HumanMessage(content=user_input))
         try:
-            result = agent.invoke({
-                "messages": [
-                    {"role": "user", "content": user_input_formated},
-                ]
-            })
+            final_state = agent.invoke(state)
+            last_message = final_state["messages"][-1]
 
-            #print(f"result: {result}")
-
-            if isinstance(result, dict) and "messages" in result:
-                last_message = result["messages"][-1]
-                if hasattr(last_message, "content"):
-                    agent_response = last_message.content
-                else:
-                    agent_response = str(last_message)
-            elif hasattr(result, "content"):
-                agent_response = result.content
-            else:
-                agent_response = str(result)
-
-            #print(f"agent_response: {agent_response}")
-            memory.save_context(role="assistant", message=agent_response)
-            new_memory = memory.load_memory_variables()["chat_history"]
-            print(f'history_after_agent_response:\n{new_memory}')
-
-            print(f"Агент: {agent_response}\n")
+            state = final_state
+            print(f"Агент: {last_message.content}\n")
 
         except Exception as e:
-            print(f"Ошибка: {e}\n")
+            print(f"Ошибка: {e}")
+            print("Попробуйте еще раз.\n")
 
 
 if __name__ == "__main__":
