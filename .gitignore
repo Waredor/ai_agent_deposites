@@ -2,3 +2,5 @@
 /.venv
 Git Workflow.png
 /src/agent.png
+/src/get_token.py
+/src/__pycache__/*
