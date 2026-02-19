@@ -12,6 +12,7 @@ from gigachat.models import (
 )
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Dict, Any
+from bs4 import BeautifulSoup
 
 
 # CONSTANTS
@@ -25,6 +26,7 @@ PROMPT_PATH = os.path.join(ROOT, "prompts", "prompt_financial_agent_ver2.txt")
 class AgentState(TypedDict):
     messages: list
     last_response_finish_reason: str
+    call_function: str
 
 
 # LLM
@@ -51,7 +53,24 @@ check_asv_desc = Function(
     )
 )
 
-def check_asv(bank_name: str, amount: int, currency: str = "RUB"):
+get_best_currency_rate_desc = Function(
+    name="get_curr_rate",
+    description="Находит лучший курс для обмена валюты в заданном городе. "
+                "Для вызова требует город, название валюты и тип операции (покупка или продажа).",
+    parameters=FunctionParameters(
+        type="object",
+        properties={
+            "operation_type": {"type": "string", "description": "осуществляемая операция (sell или buy)"},
+            "exchange_value": {"type": "string", "description": "валюта, которую нужно получить после обмена: RUB, USD, EUR, CNY"},
+            "city": {"type": "string", "description": "город в России, где осуществляется обмен валюты "
+                                                      "(Москва, Санкт-Петербург, Казань, Уфа, Челябинск, "
+                                                      "Новосибирск, Екатеринбург, Сочи, Владивосток, Хабаровск и т.д."}
+        },
+        required=["operation_type", "exchange_value", "city"]
+    )
+)
+
+def check_asv(bank_name: str, amount: int, currency: str = "RUB") -> str:
     if not bank_name or not isinstance(bank_name, str):
         return "ОШИБКА: Не указано название банка. Пожалуйста, укажите банк."
 
@@ -73,6 +92,98 @@ def check_asv(bank_name: str, amount: int, currency: str = "RUB"):
     return "Все хорошо, лимит не превышен."
 
 
+def get_currency_rate(operation_type: str, exchange_value: str, city: str) -> str:
+    banki_ru_base_url = 'https://www.banki.ru/products/currency/cash/'
+
+    city_dict = {
+        "абакан": "abakan/",
+        "екатеринбург": "ekaterinburg/",
+        "краснодар": "krasnodar/",
+        "москва": "moskva/",
+        "новосибирск": "novosibirsk/",
+        "санкт-петербург": "sankt-peterburg/",
+        "хабаровск": "habarovsk/",
+    }
+
+    wallet_dict = {
+        "usd": "currencyId=840",
+        "eur": "currencyId=978"
+    }
+
+
+    city = city_dict.get(city.lower(), None)
+    wallet = wallet_dict.get(exchange_value.lower(), None)
+
+    if city is None:
+        return f"ОШИБКА! Не могу найти курсы валют для вашего города: {city}."
+
+    if wallet is None:
+        return f"ОШИБКА! Не могу найти курсы вашей валюты {wallet}"
+
+    full_url = banki_ru_base_url + city + "?" + wallet + "&buttonId=1"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+
+    response = requests.get(full_url, headers=headers)
+    if response.status_code == 200:
+        html_page = response.text
+        soup = BeautifulSoup(html_page, 'html.parser')
+
+        bank_blocks = soup.find_all('div', attrs={'data-test': 'flexbox-grid',
+                                                  'class': 'FlexboxGrid__sc-akw86o-0 bIGLzR resultItemstyled__StyledWrapperResult-sc-qb3d7j-1 lkrmgI'})
+
+        buy_dict = {}
+        sell_dict = {}
+
+        for block in bank_blocks:
+            bank_name_element = block.find('div', attrs={'data-test': 'currenct--result-item--name'})
+            if not bank_name_element:
+                continue
+
+            bank_name = bank_name_element.text.strip()
+
+            buy_element = block.find('div', attrs={'data-test': 'currency--result-item---rate-buy'})
+            if buy_element:
+                buy_rate_element = buy_element.find('div',
+                                                    attrs={'data-test': 'text', 'class': 'Text__sc-vycpdy-0 fqodgq'})
+                if buy_rate_element:
+                    buy_text = buy_rate_element.text.strip()
+                    buy_value = float(buy_text.replace(' ₽', '').replace(',', '.'))
+                    buy_dict[bank_name] = buy_value
+
+            sell_element = block.find('div', attrs={'data-test': 'currency--result-item---rate-sell'})
+            if sell_element:
+                sell_rate_element = sell_element.find('div',
+                                                      attrs={'data-test': 'text', 'class': 'Text__sc-vycpdy-0 fqodgq'})
+                if sell_rate_element:
+                    sell_text = sell_rate_element.text.strip()
+                    sell_value = float(sell_text.replace(' ₽', '').replace(',', '.'))
+                    sell_dict[bank_name] = sell_value
+
+        sorted_buy = sorted(buy_dict.items(), key=lambda x: x[1], reverse=True)
+        sorted_sell = sorted(sell_dict.items(), key=lambda x: x[1])
+
+        if operation_type.lower() == "sell":
+            if sorted_buy:
+                best_buy_bank, best_buy_rate = sorted_buy[0]
+                return f"Лучший курс продажи валюты банку: {best_buy_bank} - {best_buy_rate}"
+            else:
+                return "ОШИБКА! Не найдено ни одного курса покупки"
+
+        elif operation_type.lower() == "buy":
+            if sorted_sell:
+                best_sell_bank, best_sell_rate = sorted_sell[0]
+                return f"Лучший курс покупки валюты у банка: {best_sell_bank} - {best_sell_rate}"
+            else:
+                return "Не найдено ни одного курса продажи"
+
+        else:
+            return f"ОШИБКА! Не могу найти курсы валют для твоей операции {operation_type}"
+
+    else:
+        return f"ОШИБКА! Не могу проверить курсы валют из-за отсутсвия доступа к сайту. Попробуйте позже."
+
 
 # NODES
 def call_agent(state: AgentState) -> Dict[str, Any]:
@@ -80,7 +191,7 @@ def call_agent(state: AgentState) -> Dict[str, Any]:
 
     dialog = Chat(
         messages=context,
-        functions=[check_asv_desc],
+        functions=[get_best_currency_rate_desc],
         temperature=0.3,
         max_tokens=1000
     )
@@ -89,7 +200,7 @@ def call_agent(state: AgentState) -> Dict[str, Any]:
     message = response.message
     context.append(message)
 
-    return {"messages": context, "last_response_finish_reason": response.finish_reason}
+    return {"messages": context}
 
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
@@ -98,8 +209,8 @@ def tool_node(state: AgentState) -> Dict[str, Any]:
     name = last_message.function_call.name
     arguments = last_message.function_call.arguments
 
-    if name == "check_asv":
-        function_result = check_asv(**arguments)
+    if name == "get_curr_rate":
+        function_result = get_currency_rate(**arguments)
 
     context.append(
         Messages(
