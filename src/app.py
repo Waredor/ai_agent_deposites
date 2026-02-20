@@ -2,6 +2,7 @@ import os
 import json
 import requests
 
+from pydantic import BaseModel
 from gigachat import GigaChat
 from gigachat.models import (
     Chat,
@@ -13,6 +14,7 @@ from gigachat.models import (
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Dict, Any
 from bs4 import BeautifulSoup
+from fastapi import FastAPI
 
 
 # CONSTANTS
@@ -24,18 +26,10 @@ PROMPT_PATH = os.path.join(ROOT, "prompts", "prompt_financial_agent_ver2.txt")
 
 # STATEDICT
 class AgentState(TypedDict):
-    messages: list
+    messages: list[dict]
     last_response_finish_reason: str
     call_function: str
-
-
-# LLM
-client = GigaChat(
-    credentials=GIGACHAT_TOKEN,
-    scope=GIGACHAT_SCOPE,
-    model="GigaChat",
-    verify_ssl_certs=False
-)
+    function_arguments: dict
 
 
 # TOOLS
@@ -186,43 +180,132 @@ def get_currency_rate(operation_type: str, exchange_value: str, city: str) -> st
 
 
 # NODES
+def llm_call(dialog, functions=None, structure=None, model='GigaChat', temperature=0.3):
+    client = GigaChat(
+        credentials=GIGACHAT_TOKEN,
+        scope=GIGACHAT_SCOPE,
+        model=model,
+        verify_ssl_certs=False
+    )
+    roles_dict = {
+        "system": MessagesRole.SYSTEM,
+        "user": MessagesRole.USER,
+        "assistant": MessagesRole.ASSISTANT,
+        "function": MessagesRole.FUNCTION
+    }
+
+    gigachat_messages = []
+    for message in dialog:
+        msg_kwargs = {
+            "role": roles_dict[message["role"]],
+            "content": message["content"]
+        }
+
+        if message["role"] == "assistant" and "function_call" in message:
+            msg_kwargs["function_call"] = message["function_call"]
+
+        gigachat_messages.append(Messages(**msg_kwargs))
+
+    if structure:
+        structure = structure.model_json_schema()
+        answer_function = Function(
+            name="llm_answer",
+            description="""Используй эту функцию для формирования ответа пользователю""",
+            parameters=FunctionParameters(
+                type=structure["type"],
+                properties=structure["properties"],
+                required=structure["required"]
+            )
+        )
+        chat = Chat(
+            messages=gigachat_messages,
+            temperature=temperature,
+            max_tokens=1024,
+            functions=[answer_function],
+            function_call="auto"
+        )
+        response = client.chat(chat).choices[0]
+
+        assert response.finish_reason == "function_call", \
+            "Вызов GigaChat со структурой не вернул объект функции, "\
+            "попробуйте еще раз или перепишите промпт"
+
+        response = response.message.function_call.arguments
+
+    else:
+        chat_params = {
+            "messages": gigachat_messages,
+            "temperature": temperature,
+            "max_tokens": 1024
+        }
+
+        if functions:
+            chat_params["functions"] = functions
+
+        chat = Chat(**chat_params)
+        response = client.chat(chat).choices[0]
+
+    return response
+
+
 def call_agent(state: AgentState) -> Dict[str, Any]:
     context = state["messages"]
 
-    dialog = Chat(
-        messages=context,
-        functions=[get_best_currency_rate_desc],
-        temperature=0.3,
-        max_tokens=1000
-    )
-
-    response = client.chat(dialog).choices[0]
+    response = llm_call(context, functions=[get_best_currency_rate_desc])
     message = response.message
-    context.append(message)
+    finish_reason = response.finish_reason
 
-    return {"messages": context}
+    assistant_msg = {"role": "assistant", "content": message.content}
+
+    if finish_reason == "function_call" and hasattr(message, 'function_call') and message.function_call:
+        function_name = message.function_call.name
+        function_arguments = message.function_call.arguments
+
+        assistant_msg["function_call"] = {
+            "name": function_name,
+            "arguments": function_arguments
+        }
+    else:
+        function_name = ""
+        function_arguments = ""
+
+    context.append(assistant_msg)
+
+    return {
+        "messages": context,
+        "last_response_finish_reason": finish_reason,
+        "call_function": function_name,
+        "function_arguments": function_arguments
+    }
 
 
 def tool_node(state: AgentState) -> Dict[str, Any]:
     context = state["messages"]
-    last_message = context[-1]
-    name = last_message.function_call.name
-    arguments = last_message.function_call.arguments
+    name = state["call_function"]
+    arguments = state["function_arguments"]
+
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
 
     if name == "get_curr_rate":
         function_result = get_currency_rate(**arguments)
+    else:
+        function_result = f"Неизвестная функция: {name}"
 
-    context.append(
-        Messages(
-            role=MessagesRole.FUNCTION,
-            content=json.dumps(
-                {"result": function_result},
-                ensure_ascii=False
-            )
-        )
-    )
+    context.append({
+        "role": "function",
+        "name": name,
+        "content": json.dumps({"result": function_result}, ensure_ascii=False)
+    })
 
-    return {"messages": context}
+    return {
+        "messages": context,
+        "call_function": "",
+        "function_arguments": {}
+    }
 
 
 def should_continue(state: AgentState):
@@ -252,50 +335,34 @@ workflow.add_conditional_edges(
 
 agent = workflow.compile()
 
+# FASTAPI
+class InPayload(BaseModel):
+    user_input: str
 
-#MAINLOOP
-def main():
-    state = {
-        "messages": []
-    }
+class OutPayload(BaseModel):
+    assistant_message: str
 
-    with open(PROMPT_PATH, mode="r", encoding="utf-8") as f:
-        system_message = f.read()
+app = FastAPI()
 
-    state["messages"].append(
-        Messages(
-            role=MessagesRole.SYSTEM,
-            content=system_message
-        )
-    )
+with open(PROMPT_PATH, mode="r", encoding="utf-8") as f:
+    system_message = f.read()
 
-    while True:
-        user_message = input("Вы: ").strip()
-        if user_message.lower() in ["пока", "до свидания!", "выход", "exit", "quit"]:
-            print("Агент: До свидания!")
-            break
-
-        if not user_message:
-            continue
-
-        state["messages"].append(
-            Messages(
-                role=MessagesRole.USER,
-                content=user_message
-            )
-        )
-
-        try:
-            final_state = agent.invoke(state)
-            last_message = final_state["messages"][-1]
-
-            state = final_state
-            print(f"Агент: {last_message.content}\n")
-
-        except Exception as e:
-            print(f"Ошибка: {e}")
-            print("Попробуйте еще раз.\n")
+app_state = {
+    "messages": [{"role": "system", "content": system_message}]
+}
 
 
-if __name__ == "__main__":
-    main()
+@app.post('/invoke', response_model=OutPayload)
+async def invoke(payload: InPayload):
+    global app_state
+
+    user_message = payload.user_input
+    app_state["messages"].append({
+        "role": "user",
+        "content": user_message
+    })
+
+    app_state = agent.invoke(app_state)
+    last_message = app_state["messages"][-1]
+
+    return OutPayload(assistant_message=last_message["content"])
