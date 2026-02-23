@@ -1,9 +1,8 @@
 import os
 import json
-import asyncio
-import logging
 import requests
 
+from pydantic import BaseModel
 from gigachat import GigaChat
 from gigachat.models import (
     Chat,
@@ -15,32 +14,14 @@ from gigachat.models import (
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Dict, Any
 from bs4 import BeautifulSoup
-from pathlib import Path
-from dotenv import load_dotenv
-from telegram import (
-    Update
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    filters, CallbackContext,
-)
+from fastapi import FastAPI
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
 
 # CONSTANTS
-ROOT = Path(__file__).resolve().parent.parent
-ENV_PATH = os.path.join(ROOT, ".env")
-load_dotenv(dotenv_path=ENV_PATH)
-
-TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-GIGACHAT_API_TOKEN = os.environ["GIGACHAT_API_TOKEN"]
+GIGACHAT_TOKEN = "MDE5YTJiN2MtZjg4NC03MDJiLWE3NWMtNGRlZWE0NDU1ZDJlOmVhOGUzOTI1LTEwMWItNGNkOS1iMDE2LWNkZTNkMjBjNDI5MA=="
 GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
-PROMPT_PATH = os.path.join(ROOT, "src", "prompts", "prompt_financial_agent_ver2.txt")
+ROOT = os.path.dirname(__file__)
+PROMPT_PATH = os.path.join(ROOT, "prompts", "prompt_financial_agent_ver2.txt")
 
 
 # STATEDICT
@@ -49,14 +30,6 @@ class AgentState(TypedDict):
     last_response_finish_reason: str
     call_function: str
     function_arguments: dict
-
-
-with open(PROMPT_PATH, mode="r", encoding="utf-8") as f:
-    system_message = f.read()
-
-app_state = {
-    "messages": [{"role": "system", "content": system_message}]
-}
 
 
 # TOOLS
@@ -209,7 +182,7 @@ def get_currency_rate(operation_type: str, exchange_value: str, city: str) -> st
 # NODES
 def llm_call(dialog, functions=None, structure=None, model='GigaChat', temperature=0.3):
     client = GigaChat(
-        credentials=GIGACHAT_API_TOKEN,
+        credentials=GIGACHAT_TOKEN,
         scope=GIGACHAT_SCOPE,
         model=model,
         verify_ssl_certs=False
@@ -362,48 +335,34 @@ workflow.add_conditional_edges(
 
 agent = workflow.compile()
 
-#BOT_FUNCTIONS
-async def start_cmd(update, context) -> None:
-    await update.message.reply_text(
-        "Привет! Я бот для работы с LangGraph агентами!"
-    )
+# FASTAPI
+class InPayload(BaseModel):
+    user_input: str
 
-async def help_cmd(update, context) -> None:
-    await update.message.reply_text(
-        "Вот что я умею:..."
-    )
+class OutPayload(BaseModel):
+    assistant_message: str
 
-async def text_message(update, context) -> None:
+app = FastAPI()
+
+with open(PROMPT_PATH, mode="r", encoding="utf-8") as f:
+    system_message = f.read()
+
+app_state = {
+    "messages": [{"role": "system", "content": system_message}]
+}
+
+
+@app.post('/invoke', response_model=OutPayload)
+async def invoke(payload: InPayload):
     global app_state
 
-    message_text = update.message.text
-    chat_id = update.effective_chat.id
-
+    user_message = payload.user_input
     app_state["messages"].append({
         "role": "user",
-        "content": message_text
+        "content": user_message
     })
 
-    logging.info("LangGraph started...")
-    result = agent.invoke(app_state)
-    logging.info("LangGraph ended...")
+    app_state = agent.invoke(app_state)
+    last_message = app_state["messages"][-1]
 
-    reply_text = result["messages"][-1]["content"]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=reply_text
-    )
-
-def main() -> None:
-    app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_message))
-
-    logging.info("Bot started …")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+    return OutPayload(assistant_message=last_message["content"])
