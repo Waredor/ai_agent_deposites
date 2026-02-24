@@ -3,4 +3,6 @@
 Git Workflow.png
 /src/agent.png
 /src/get_token.py
+/src/main.py
+/src/agent.py
 /src/__pycache__/*

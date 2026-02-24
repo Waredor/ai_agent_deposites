@@ -362,15 +362,18 @@ workflow.add_conditional_edges(
 
 agent = workflow.compile()
 
+
 #BOT_FUNCTIONS
 async def start_cmd(update, context) -> None:
+    app_state["messages"] = [app_state["messages"][0]]
     await update.message.reply_text(
-        "Привет! Я бот для работы с LangGraph агентами!"
+        "Привет! Я бот для поиска лучших курсов валют в твоем городе."
     )
 
 async def help_cmd(update, context) -> None:
     await update.message.reply_text(
-        "Вот что я умею:..."
+        """Вот что я умею:
+        1. Поиск лучшего курса для покупки или продажи наличной валюты в твоем городе"""
     )
 
 async def text_message(update, context) -> None:
