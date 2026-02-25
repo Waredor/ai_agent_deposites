@@ -6,3 +6,4 @@ Git Workflow.png
 /src/main.py
 /src/agent.py
 /src/__pycache__/*
+env_mine
